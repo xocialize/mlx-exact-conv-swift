@@ -49,10 +49,22 @@ public enum ExactConv {
         return c % 32 == 0 && o % 32 == 0 && c + o >= 256 && x.dim(0) * x.dim(1) * x.dim(2) >= 4096
     }
 
-    /// True when a conv3d would be decomposed into Winograd-eligible conv2d (mlx-swift 0.32.x) or is
-    /// otherwise worth forcing onto implicit GEMM: groups 1 and channels already a multiple of 16.
-    public static func needsChannelPad3D(input x: MLXArray, weight: MLXArray, groups: Int = 1) -> Bool {
-        x.ndim == 5 && groups == 1 && x.dim(4) % 16 == 0
+    /// True when mlx-swift 0.32.x would split this conv3d into per-frame conv2d that lands in the
+    /// Winograd window (mlx#3785: groups 1, N 1, kD ≤ 7, depth stride/dilation 1, depth padding 0),
+    /// so it needs the exact path. Shapes outside the window are already exact and are left alone
+    /// (e.g. a 1024² 96-channel decoder stage: C + O < 256).
+    public static func takesWinograd3D(
+        input x: MLXArray, weight: MLXArray, stride: (Int, Int, Int) = (1, 1, 1),
+        padding: (Int, Int, Int) = (0, 0, 0), dilation: (Int, Int, Int) = (1, 1, 1), groups: Int = 1
+    ) -> Bool {
+        guard x.ndim == 5, groups == 1, x.dim(0) == 1, weight.dim(1) <= 7,
+            stride.0 == 1, dilation.0 == 1, padding.0 == 0,
+            weight.dim(2) == 3, weight.dim(3) == 3, stride.1 == 1, stride.2 == 1,
+            dilation.1 == 1, dilation.2 == 1
+        else { return false }
+        let (c, o) = (x.dim(4), weight.dim(0))
+        let frames = x.dim(1) - weight.dim(1) + 1
+        return c % 32 == 0 && o % 32 == 0 && c + o >= 256 && frames * x.dim(2) * x.dim(3) >= 4096
     }
 
     /// Appends one zero channel on the last (channel) axis. Use for inputs and OHWC / ODHWC weights.
@@ -102,14 +114,18 @@ public enum ExactConv {
     }
 
     /// A conv3d (NDHWC input, ODHWC weight) kept on implicit GEMM when 0.32.x would split it into
-    /// Winograd conv2d. Pass a cached `appendingZeroChannel(weight)` as `exactWeight` when possible.
+    /// Winograd conv2d (`takesWinograd3D`); every other shape runs plain conv3d. Cost of the exact path
+    /// at causal-VAE shapes on 0.32.3: 256² 384 ch 40 ms vs 12 ms lossy (0.31.6 exact: 37 ms).
     public static func conv3d(
         _ x: MLXArray, weight: MLXArray, bias: MLXArray? = nil,
         stride: (Int, Int, Int) = (1, 1, 1), padding: (Int, Int, Int) = (0, 0, 0),
         dilation: (Int, Int, Int) = (1, 1, 1), groups: Int = 1,
         exact: Bool = true, exactWeight: MLXArray? = nil
     ) -> MLXArray {
-        let usePad = exact && needsChannelPad3D(input: x, weight: weight, groups: groups)
+        let usePad = exact
+            && takesWinograd3D(
+                input: x, weight: weight, stride: stride, padding: padding, dilation: dilation,
+                groups: groups)
         var y = MLX.conv3d(
             usePad ? appendingZeroChannel(x) : x,
             usePad ? (exactWeight ?? appendingZeroChannel(weight)) : weight,

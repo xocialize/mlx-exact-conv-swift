@@ -111,6 +111,28 @@ final class ExactConvTests: XCTestCase {
         XCTAssertLessThan(rel(exact, ref), exactBound)
     }
 
+    func testWinograd3DPredicate() {
+        let w = MLXArray.zeros([128, 3, 3, 3, 128])
+        XCTAssertTrue(ExactConv.takesWinograd3D(input: MLXArray.zeros([1, 3, 64, 64, 128]), weight: w))
+        XCTAssertFalse(  // N = 2: mlx keeps the 3D implicit GEMM
+            ExactConv.takesWinograd3D(input: MLXArray.zeros([2, 3, 64, 64, 128]), weight: w))
+        XCTAssertFalse(  // depth padding
+            ExactConv.takesWinograd3D(
+                input: MLXArray.zeros([1, 3, 64, 64, 128]), weight: w, padding: (1, 0, 0)))
+        XCTAssertFalse(  // C + O < 256: per-frame conv2d is already exact
+            ExactConv.takesWinograd3D(
+                input: MLXArray.zeros([1, 3, 256, 256, 96]), weight: MLXArray.zeros([96, 3, 3, 3, 96])))
+    }
+
+    func testConv3dOutsideWindowIsPlain() {
+        MLXRandom.seed(6)
+        let x = MLXRandom.normal([1, 3, 64, 64, 96])
+        let w = MLXRandom.normal([96, 3, 3, 3, 96]) * 0.02
+        let a = ExactConv.conv3d(x, weight: w, padding: (0, 1, 1))
+        let b = MLX.conv3d(x, w, padding: [0, 1, 1])
+        XCTAssertEqual(rel(a, b), 0)
+    }
+
     func testEnvironmentParsing() {
         setenv("MLXEXACTCONV_TEST_ROUTE", "exact", 1)
         XCTAssertEqual(ExactConvRoute.environment("MLXEXACTCONV_TEST_ROUTE"), .exact)
