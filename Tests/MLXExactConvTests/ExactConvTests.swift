@@ -133,6 +133,150 @@ final class ExactConvTests: XCTestCase {
         XCTAssertEqual(rel(a, b), 0)
     }
 
+    func testExactConv3dDepthOne() {
+        MLXRandom.seed(7)
+        let x = MLXRandom.normal([1, 2, 64, 64, 128])
+        let w = MLXRandom.normal([128, 1, 3, 3, 128]) * 0.02
+        XCTAssertTrue(ExactConv.takesWinograd3D(input: x, weight: w))
+        let ref = cpu { MLX.conv3d(x, w, padding: [0, 1, 1]) }
+        let exact = ExactConv.conv3d(x, weight: w, padding: (0, 1, 1))
+        eval(exact)
+        print(String(format: "EXACTCONV conv3d kD=1 exact %.2e", rel(exact, ref)))
+        XCTAssertEqual(exact.shape, ref.shape)
+        XCTAssertLessThan(rel(exact, ref), exactBound)
+    }
+
+    func testLegacyExactWeightLayout() {
+        MLXRandom.seed(8)
+        let x = MLXRandom.normal([1, 64, 64, 128])
+        let w = MLXRandom.normal([128, 3, 3, 128]) * 0.02
+        let legacy = ExactConv.appendingZeroChannel(w.expandedDimensions(axis: 1))  // 0.1.0's layout
+        let a = ExactConv.conv2d(x, weight: w, padding: (1, 1), route: .exact)
+        let b = ExactConv.conv2d(x, weight: w, padding: (1, 1), route: .exact, exactWeight: legacy)
+        let c = ExactConv.conv2d(
+            x, weight: w, padding: (1, 1), route: .exact, exactWeight: ExactConv.exactWeight2D(w))
+        XCTAssertEqual(rel(b, a), 0)
+        XCTAssertEqual(rel(c, a), 0)
+    }
+
+    func testPadHelperPredicates() {
+        let x17 = MLXArray.zeros([1, 2, 32, 32, 17])
+        XCTAssertTrue(ExactConv.takesPadHelper3D(input: x17, weight: MLXArray.zeros([32, 1, 3, 3, 17])))
+        XCTAssertTrue(  // O > 16, not a multiple of 16
+            ExactConv.takesPadHelper3D(
+                input: MLXArray.zeros([1, 2, 32, 32, 32]), weight: MLXArray.zeros([24, 1, 3, 3, 32])))
+        XCTAssertFalse(  // O ≤ 16 is fine
+            ExactConv.takesPadHelper3D(
+                input: MLXArray.zeros([1, 2, 32, 32, 32]), weight: MLXArray.zeros([3, 1, 3, 3, 32])))
+        XCTAssertFalse(
+            ExactConv.takesPadHelper3D(input: x17, weight: MLXArray.zeros([32, 1, 3, 3, 17]), groups: 17))
+
+        let x24 = MLXArray.zeros([1, 32, 32, 24])
+        let w24 = MLXArray.zeros([32, 3, 3, 24])
+        XCTAssertTrue(ExactConv.takesPadHelper2D(input: x24, weight: w24, padding: (1, 1)))
+        XCTAssertFalse(ExactConv.takesPadHelper2D(input: x24, weight: w24, stride: (2, 2), padding: (1, 1)))
+        XCTAssertFalse(  // C ≤ 4 takes the specialized kernel as is
+            ExactConv.takesPadHelper2D(
+                input: MLXArray.zeros([1, 32, 32, 3]), weight: MLXArray.zeros([32, 3, 3, 3]), padding: (1, 1)))
+        XCTAssertFalse(  // 1x1 kernel
+            ExactConv.takesPadHelper2D(input: x24, weight: MLXArray.zeros([32, 1, 1, 24])))
+        XCTAssertFalse(  // N·OH·OW < 256
+            ExactConv.takesPadHelper2D(
+                input: MLXArray.zeros([1, 8, 8, 24]), weight: w24, padding: (1, 1)))
+        XCTAssertFalse(  // unaligned output channels: mlx takes the general kernel, no pad
+            ExactConv.takesPadHelper2D(input: x24, weight: MLXArray.zeros([24, 3, 3, 24]), padding: (1, 1)))
+    }
+
+    func testPadHelperShapesMatchCPU() {
+        MLXRandom.seed(9)
+        func check(_ name: String, _ ref: MLXArray, _ y: MLXArray) {
+            eval(y)
+            print(String(format: "EXACTCONV %@ %.2e", name, rel(y, ref)))
+            XCTAssertEqual(y.shape, ref.shape, name)
+            XCTAssertLessThan(rel(y, ref), exactBound, name)
+        }
+        for kd in [1, 3] {
+            let x = MLXRandom.normal([1, kd + 1, 48, 48, 17])
+            let w = MLXRandom.normal([32, kd, 3, 3, 17]) * 0.05
+            check("conv3d C=17 kD=\(kd)", cpu { MLX.conv3d(x, w, padding: [0, 1, 1]) },
+                  ExactConv.conv3d(x, weight: w, padding: (0, 1, 1)))
+        }
+        let x32 = MLXRandom.normal([1, 2, 48, 48, 32])
+        let w24 = MLXRandom.normal([24, 1, 3, 3, 32]) * 0.05
+        check("conv3d O=24", cpu { MLX.conv3d(x32, w24, padding: [0, 1, 1]) },
+              ExactConv.conv3d(x32, weight: w24, padding: (0, 1, 1)))
+        // Padded to 128 channels this conv3d would split into Winograd conv2d; it must stay exact.
+        let x120 = MLXRandom.normal([1, 1, 64, 64, 120])
+        let w120 = MLXRandom.normal([128, 1, 3, 3, 120]) * 0.02
+        check("conv3d C=120 O=128", cpu { MLX.conv3d(x120, w120, padding: [0, 1, 1]) },
+              ExactConv.conv3d(x120, weight: w120, padding: (0, 1, 1)))
+
+        let x = MLXRandom.normal([1, 48, 48, 24])
+        let w = MLXRandom.normal([32, 3, 3, 24]) * 0.05
+        let b = MLXRandom.normal([32]) * 0.1
+        check("conv2d C=24", cpu { MLX.conv2d(x, w, padding: 1) + b },
+              ExactConv.conv2d(x, weight: w, bias: b, padding: (1, 1), route: .exact))
+        let xb = MLXRandom.normal([1, 64, 64, 120])
+        let wb = MLXRandom.normal([128, 3, 3, 120]) * 0.02
+        check("conv2d C=120 O=128", cpu { MLX.conv2d(xb, wb, padding: 1) },
+              ExactConv.conv2d(xb, weight: wb, padding: (1, 1), route: .exact))
+    }
+
+    /// The AB-T-0214 regression. mlx's channel-pad helpers free their scalar fill value before the
+    /// command buffer runs; with the buffer cache at its limit the freed buffer goes back to the OS at
+    /// once, and the GPU faults ("Invalid Resource"), which aborts this process. A cache limit of 0
+    /// releases every freed buffer, and holding 20k small arrays fills the allocator's small-buffer
+    /// heap, so the fill value is a standalone MTLBuffer: on 0.1.0 the first exact conv crashes.
+    func testNoConvFreesABufferInFlight() {
+        let previous = Memory.cacheLimit
+        Memory.cacheLimit = 0
+        defer { Memory.cacheLimit = previous }
+        let small = (0 ..< 20_000).map { MLXArray(Float($0)) }
+        eval(small)
+        MLXRandom.seed(10)
+        withExtendedLifetime(small) {
+            for _ in 0 ..< 3 {
+                var ys: [MLXArray] = []
+                let x2 = MLXRandom.normal([1, 64, 64, 128])
+                ys.append(ExactConv.conv2d(
+                    x2, weight: MLXRandom.normal([128, 3, 3, 128]), padding: (1, 1), route: .exact))
+                let x3 = MLXRandom.normal([1, 3, 64, 64, 128])
+                ys.append(ExactConv.conv3d(x3, weight: MLXRandom.normal([128, 1, 3, 3, 128]), padding: (0, 1, 1)))
+                ys.append(ExactConv.conv3d(x3, weight: MLXRandom.normal([128, 3, 3, 3, 128]), padding: (0, 1, 1)))
+                ys.append(ExactConv.conv3d(
+                    MLXRandom.normal([1, 2, 48, 48, 17]), weight: MLXRandom.normal([32, 1, 3, 3, 17]),
+                    padding: (0, 1, 1)))
+                ys.append(ExactConv.conv2d(
+                    MLXRandom.normal([1, 48, 48, 24]), weight: MLXRandom.normal([32, 3, 3, 24]),
+                    padding: (1, 1), route: .exact))
+                eval(ys)
+            }
+        }
+    }
+
+    /// Timings for the doc comment (EXACTCONV_BENCH=1): exact routes at causal-VAE shapes.
+    func testBenchExactRoutes() throws {
+        try XCTSkipUnless(ProcessInfo.processInfo.environment["EXACTCONV_BENCH"] == "1", "EXACTCONV_BENCH=1")
+        func ms(_ f: () -> MLXArray) -> Double {
+            for _ in 0 ..< 3 { eval(f()) }
+            let t = Date()
+            for _ in 0 ..< 10 { eval(f()) }
+            return -t.timeIntervalSinceNow * 100
+        }
+        let x = MLXRandom.normal([1, 256, 256, 384]).asType(.bfloat16)
+        let w = (MLXRandom.normal([384, 3, 3, 384]) * 0.02).asType(.bfloat16)
+        let x3 = MLXRandom.normal([1, 3, 256, 256, 384]).asType(.bfloat16)
+        let w3 = (MLXRandom.normal([384, 3, 3, 3, 384]) * 0.02).asType(.bfloat16)
+        eval(x, w, x3, w3)
+        print(String(
+            format: "EXACTCONV bench 256² 384→384 bf16: conv2d exact %.1f ms, winograd %.1f ms; "
+                + "conv3d kD=3 exact %.1f ms, lossy %.1f ms",
+            ms { ExactConv.conv2d(x, weight: w, padding: (1, 1), route: .exact) },
+            ms { ExactConv.conv2d(x, weight: w, padding: (1, 1), route: .winograd) },
+            ms { ExactConv.conv3d(x3, weight: w3, padding: (0, 1, 1)) },
+            ms { ExactConv.conv3d(x3, weight: w3, padding: (0, 1, 1), exact: false) }))
+    }
+
     func testEnvironmentParsing() {
         setenv("MLXEXACTCONV_TEST_ROUTE", "exact", 1)
         XCTAssertEqual(ExactConvRoute.environment("MLXEXACTCONV_TEST_ROUTE"), .exact)
